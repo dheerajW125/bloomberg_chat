@@ -98,3 +98,35 @@ def main() -> int:
 
     sheet: str | int = args.sheet
     if isinstance(sheet, str) and sheet.isdigit():
+        sheet = int(sheet)
+
+    if args.file.lower().endswith(".csv"):
+        frame = pd.read_csv(args.file, header=None, skiprows=args.skip_rows)
+    else:
+        frame = pd.read_excel(args.file, sheet_name=sheet, header=None, skiprows=args.skip_rows)
+
+    emitted = 0
+    for zero_idx, row in frame.iterrows():
+        input_row_num = zero_idx + args.skip_rows + 1
+        if input_row_num < args.start_row:
+            continue
+
+        event = build_event(input_row_num, row, args)
+        if not event["message"]:
+            continue
+
+        if args.http_url:
+            emit_http(event, args.http_url)
+        else:
+            emit_stdout(event)
+
+        emitted += 1
+        if args.limit and emitted >= args.limit:
+            break
+        time.sleep(args.interval)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
