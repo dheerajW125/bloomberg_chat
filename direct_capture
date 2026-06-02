@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Direct Excel capture pipeline for Bloomberg-style chat rows.
+
+This is the alternate path when you do not want:
+  Excel -> simulator -> HTTP capture pipeline
+
+Instead it does:
+  Excel -> direct capture pipeline -> CSV/JSONL
+
+Default column mapping matches the screenshots:
+  A = date, B = timestamp, C = sender name, D = chat_id, E = sender/client id, F = message
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    import pandas as pd
+except ImportError as exc:
+    raise SystemExit("Install dependencies first: pip install pandas openpyxl") from exc
+
+
+DEFAULT_CLIENT_IDS = {
+    "15409927",
+    "19020",
+    "8233522",
+    "7659808",
+    "32879265",
+    "29268290",
+    "15793230",
+    "29337542",
+    "29705945",
+    "7792265",
+    "23586289",
+}
+
+
+def excel_col_to_index(col: str) -> int:
+    value = 0
+    for char in col.strip().upper():
+        if not ("A" <= char <= "Z"):
+            raise ValueError(f"Invalid Excel column: {col}")
+        value = value * 26 + (ord(char) - ord("A") + 1)
+    return value - 1
+
+
+def cell(row: Any, col: str) -> Any:
+    idx = excel_col_to_index(col)
+    if idx >= len(row):
+        return None
+    value = row.iloc[idx]
+    return None if pd.isna(value) else value
+
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def parse_client_ids(value: str) -> set[str]:
+    if not value.strip():
+        return set(DEFAULT_CLIENT_IDS)
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def read_frame(file_path: str, sheet: str | int, skip_rows: int) -> "pd.DataFrame":
+    if file_path.lower().endswith(".csv"):
+        return pd.read_csv(file_path, header=None, skiprows=skip_rows)
+    return pd.read_excel(file_path, sheet_name=sheet, header=None, skiprows=skip_rows)
+
+
+def build_capture_row(row_num: int, row: Any, args: argparse.Namespace) -> dict[str, str]:
+    return {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "source_date": clean_text(cell(row, args.date_col)),
+        "source_timestamp": clean_text(cell(row, args.timestamp_col)),
+        "sender_name": clean_text(cell(row, args.sender_name_col)),
+        "sender_id": clean_text(cell(row, args.sender_id_col)),
+        "chat_id": clean_text(cell(row, args.chat_id_col)),
+        "message": clean_text(cell(row, args.message_col)),
+        "source_row_num": str(row_num),
+    }
+
+
+class CaptureWriter:
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = output_dir / "direct_excel_capture.csv"
+        self.jsonl_path = output_dir / "direct_excel_capture.jsonl"
+        self._ensure_csv_header()
+
+    @staticmethod
+    def fields() -> list[str]:
+        return [
+            "captured_at",
+            "source_date",
+            "source_timestamp",
+            "sender_name",
+            "sender_id",
+            "chat_id",
+            "message",
+            "source_row_num",
+        ]
+
+    def _ensure_csv_header(self) -> None:
+        if self.csv_path.exists():
+            return
+        with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=self.fields()).writeheader()
+
+    def append(self, row: dict[str, str]) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=self.fields()).writerow(row)
+
+
+def should_capture(row: dict[str, str], client_ids: set[str], capture_all: bool) -> bool:
+    if not row["message"]:
+        return False
+    return capture_all or row["sender_id"] in client_ids
+
+
+def replay_once(args: argparse.Namespace, writer: CaptureWriter, client_ids: set[str]) -> None:
+    frame = read_frame(args.file, args.sheet, args.skip_rows)
+    emitted = 0
+
+    for zero_idx, row in frame.iterrows():
+        source_row_num = zero_idx + args.skip_rows + 1
+        if source_row_num < args.start_row:
+            continue
+
+        capture_row = build_capture_row(source_row_num, row, args)
+        if not should_capture(capture_row, client_ids, args.capture_all):
+            continue
+
+        writer.append(capture_row)
+        emitted += 1
+        print(
+            f'{capture_row["captured_at"]} sender_id={capture_row["sender_id"]} '
+            f'time={capture_row["source_timestamp"]} message={capture_row["message"]}',
+            flush=True,
+        )
+
+        if args.limit and emitted >= args.limit:
+            return
+        time.sleep(args.interval)
+
+
+def poll_for_new_rows(args: argparse.Namespace, writer: CaptureWriter, client_ids: set[str]) -> None:
+    next_row_num = args.start_row
+    emitted = 0
+
+    while True:
+        frame = read_frame(args.file, args.sheet, args.skip_rows)
+        for zero_idx, row in frame.iterrows():
+            source_row_num = zero_idx + args.skip_rows + 1
+            if source_row_num < next_row_num:
+                continue
+
+            capture_row = build_capture_row(source_row_num, row, args)
+            next_row_num = source_row_num + 1
+
+            if not should_capture(capture_row, client_ids, args.capture_all):
+                continue
+
+            writer.append(capture_row)
+            emitted += 1
+            print(
+                f'{capture_row["captured_at"]} sender_id={capture_row["sender_id"]} '
+                f'time={capture_row["source_timestamp"]} message={capture_row["message"]}',
+                flush=True,
+            )
+
+            if args.limit and emitted >= args.limit:
+                return
+            time.sleep(args.interval)
+
+        time.sleep(args.poll_interval)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", required=True, help="Path to .xlsx/.xls/.csv file")
+    parser.add_argument("--sheet", default=0, help="Excel sheet name or zero-based index")
+    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between captured messages")
+    parser.add_argument("--poll", action="store_true", help="Keep watching the sheet for newly added rows")
+    parser.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between Excel refresh checks")
+    parser.add_argument("--skip-rows", type=int, default=0, help="Rows to skip at top")
+    parser.add_argument("--start-row", type=int, default=1, help="1-based Excel row to start from")
+    parser.add_argument("--limit", type=int, default=0, help="Maximum captured messages; 0 means no limit")
+    parser.add_argument("--date-col", default="A")
+    parser.add_argument("--timestamp-col", default="B")
+    parser.add_argument("--sender-name-col", default="C")
+    parser.add_argument("--chat-id-col", default="D")
+    parser.add_argument("--sender-id-col", default="E")
+    parser.add_argument("--message-col", default="F")
+    parser.add_argument("--client-ids", default="", help="Comma-separated sender IDs; blank uses default list")
+    parser.add_argument("--capture-all", action="store_true", help="Capture all rows with messages")
+    parser.add_argument(
+        "--output-dir",
+        default=str(Path(__file__).resolve().parent),
+        help="Folder where JSONL and CSV capture files are saved",
+    )
+    args = parser.parse_args()
+
+    if isinstance(args.sheet, str) and args.sheet.isdigit():
+        args.sheet = int(args.sheet)
+
+    writer = CaptureWriter(Path(args.output_dir))
+    client_ids = parse_client_ids(args.client_ids)
+
+    print("Direct Excel capture started")
+    print(f"Excel file: {args.file}")
+    print(f"Capturing IDs: {'ALL' if args.capture_all else ', '.join(sorted(client_ids))}")
+    print(f"CSV output:   {writer.csv_path}")
+    print(f"JSONL output: {writer.jsonl_path}")
+
+    if args.poll:
+        poll_for_new_rows(args, writer, client_ids)
+    else:
+        replay_once(args, writer, client_ids)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
