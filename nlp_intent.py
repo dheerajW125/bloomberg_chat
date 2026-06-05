@@ -33,23 +33,39 @@ QTY_RE = re.compile(
 )
 
 BUY_TERMS = {
+    "b",
     "buy",
+    "buyer",
     "bought",
     "bid",
     "lift",
     "lifted",
+    "pay",
+    "paid",
+    "payer",
+    "take",
+    "took",
+    "work",
+    "working",
     "compra",
     "comprar",
     "compro",
     "comprei",
     "comprando",
+    "pagar",
+    "pago",
 }
 
 SELL_TERMS = {
+    "s",
     "sell",
+    "seller",
+    "selling",
     "sold",
     "offer",
     "offered",
+    "hit",
+    "hitting",
     "short",
     "vende",
     "vender",
@@ -118,6 +134,36 @@ STOPWORDS = {
     "USD",
     "US",
     "YOU",
+}
+
+NEWS_TERMS = {
+    "ALERT",
+    "CALL",
+    "CNBC",
+    "CONFERENCE",
+    "EARNINGS",
+    "EQUITY",
+    "FORECAST",
+    "HOSTED",
+    "INDICATIONS",
+    "MOVERS",
+    "NEWS",
+    "NOTE",
+    "OUTLOOK",
+    "REPORT",
+    "REPORTED",
+    "RESEARCH",
+    "TV",
+}
+
+CONTINUATION_TERMS = {
+    "ALSO",
+    "AND",
+    "EACH",
+    "INLINE",
+    "POV",
+    "SAME",
+    "TOP",
 }
 
 
@@ -232,13 +278,27 @@ def read_events(path: Path) -> Iterable[dict[str, Any]]:
         yield from csv.DictReader(handle)
 
 
-def detect_quantity(message: str) -> tuple[str, str]:
+def detect_quantity(message: str, tickers: list[str] | None = None) -> tuple[str, str]:
     match = QTY_RE.search(message)
-    if not match:
+    if match:
+        quantity = match.group("num").replace(",", ".")
+        unit = match.group("unit").lower()
+        return quantity, unit
+
+    if not tickers:
         return "", ""
-    quantity = match.group("num").replace(",", ".")
-    unit = match.group("unit").lower()
-    return quantity, unit
+
+    ticker_pattern = "|".join(re.escape(ticker) for ticker in tickers)
+    bare_qty_re = re.compile(
+        rf"\b(?:B|S|BUY|SELL|SOLD|VENDE|COMPRA)?\s*"
+        rf"(?P<num>\d{{1,3}}(?:,\d{{3}})*(?:\.\d+)?|\d+(?:\.\d+)?)\s+"
+        rf"(?P<ticker>{ticker_pattern})\b",
+        re.IGNORECASE,
+    )
+    bare_match = bare_qty_re.search(message)
+    if not bare_match:
+        return "", ""
+    return bare_match.group("num").replace(",", ""), ""
 
 
 def fuzzy_symbol(token: str, symbol_set: set[str], threshold: float) -> str:
@@ -274,6 +334,26 @@ def is_noise(message: str, nlp: NlpEngine) -> bool:
         return True
     words = normalized_words.split()
     return len(words) <= 3 and all(word in STOPWORDS for word in words)
+
+
+def looks_like_news_or_research(message: str, nlp: NlpEngine) -> bool:
+    tokens = set(nlp.normalized_tokens(message))
+    return bool(tokens & NEWS_TERMS)
+
+
+def is_context_continuation(message: str, tickers: list[str], nlp: NlpEngine) -> bool:
+    if not tickers or looks_like_news_or_research(message, nlp):
+        return False
+
+    tokens = nlp.normalized_tokens(message)
+    if len(tokens) <= 6:
+        return True
+
+    if tokens and tokens[0] in CONTINUATION_TERMS:
+        return True
+
+    lowered = message.lower()
+    return "same for" in lowered or "each of" in lowered or "on top of prior" in lowered
 
 
 def sender_key(event: dict[str, Any]) -> str:
@@ -346,16 +426,16 @@ def process_one_event(
     context = contexts.setdefault(key, SenderContext())
 
     side = nlp.detect_side(message)
-    quantity, quantity_unit = detect_quantity(message)
     tickers = extract_symbols(message, symbol_set, fuzzy_threshold, nlp)
+    quantity, quantity_unit = detect_quantity(message, tickers)
 
     has_explicit_intent = bool(side or quantity)
-    can_use_context = bool(context.side and context.quantity)
+    can_use_context = bool(context.side and context.quantity) and is_context_continuation(message, tickers, nlp)
 
     if has_explicit_intent and tickers:
         final_side = side or context.side
         final_quantity = quantity or context.quantity
-        final_unit = quantity_unit or context.quantity_unit
+        final_unit = quantity_unit if quantity else context.quantity_unit
         context.side = final_side
         context.quantity = final_quantity
         context.quantity_unit = final_unit
@@ -372,12 +452,14 @@ def process_one_event(
             True,
         )
 
-    if has_explicit_intent and not tickers and keep_unmatched_intent:
+    if has_explicit_intent and not tickers:
         if side:
             context.side = side
         if quantity:
             context.quantity = quantity
             context.quantity_unit = quantity_unit
+        if not keep_unmatched_intent:
+            return None
         return build_output_row(event, message, side, quantity, quantity_unit, [], False)
 
     return None
