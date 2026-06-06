@@ -20,8 +20,10 @@ import argparse
 import csv
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,6 +31,44 @@ from typing import Any, Iterable
 
 QTY_RE = re.compile(
     r"\b(?P<num>\d+(?:[.,]\d+)?)\s*(?P<unit>pc|pcs|pct|%|k|m|mm|mn|usd|eur|gbp|shares|shs|lots?)\b",
+    re.IGNORECASE,
+)
+
+LIMIT_RANGE_PATTERNS = [
+    re.compile(
+        r"\b(?:at\s+)?(?:limit\s+)?(?P<low>\d+(?:\.\d+)?)\s*(?:-|to)\s*"
+        r"(?P<high>\d+(?:\.\d+)?)\s*(?:limit)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\blimit\s+(?P<low>\d+(?:\.\d+)?)\s*(?:-|to)\s*"
+        r"(?P<high>\d+(?:\.\d+)?)\b",
+        re.IGNORECASE,
+    ),
+]
+
+LIMIT_SINGLE_PATTERNS = [
+    re.compile(
+        r"\bat\s+(?P<price>\d+(?:\.\d+)?)\s+limit\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\blimit\s+(?P<price>\d+(?:\.\d+)?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"@\s*(?P<price>\d+(?:\.\d+)?)\s*(?:limit|lim)\b",
+        re.IGNORECASE,
+    ),
+]
+
+COMPACT_ORDER_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<side>B|S|BUY|SELL|BOUGHT|SOLD)\s*"
+    r"(?P<quantity>\d+(?:[.,]\d+)?)\s*"
+    r"(?P<unit>K|M|MM|MN)?\s+"
+    r"(?P<ticker>[A-Za-z][A-Za-z0-9.\-]{0,9})"
+    r"(?:\s*(?:@|FOR|AT)\s*(?P<price>\d+(?:\.\d+)?))?",
     re.IGNORECASE,
 )
 
@@ -40,6 +80,8 @@ BUY_TERMS = {
     "bid",
     "lift",
     "lifted",
+    "load",
+    "loaded",
     "pay",
     "paid",
     "payer",
@@ -108,6 +150,7 @@ STOPWORDS = {
     "DE",
     "DO",
     "DOS",
+    "EACH",
     "FOR",
     "FROM",
     "GOOD",
@@ -118,6 +161,7 @@ STOPWORDS = {
     "IN",
     "IS",
     "IT",
+    "LIMIT",
     "MATE",
     "ME",
     "NO",
@@ -127,6 +171,9 @@ STOPWORDS = {
     "ON",
     "OR",
     "PLEASE",
+    "PRICE",
+    "PC",
+    "PCS",
     "TARDE",
     "THANKS",
     "THE",
@@ -166,12 +213,177 @@ CONTINUATION_TERMS = {
     "TOP",
 }
 
+RELOAD_TERMS = {"REBUY", "RELOAD"}
+RESET_PHRASES = {
+    "CANCEL",
+    "CANCEL ALL",
+    "DONE",
+    "FINISHED",
+    "THATS ALL",
+    "THATS IT",
+    "WE ARE GOOD",
+}
+
+PORTUGUESE_STRONG_HINTS = {
+    "COMPRAR",
+    "COMPRA",
+    "COMPREI",
+    "COMPRO",
+    "CONSOLIDADO",
+    "FALA",
+    "MANDA",
+    "MESTRE",
+    "PAGAR",
+    "PAGO",
+    "TRABALHA",
+    "VENDA",
+    "VENDE",
+    "VENDER",
+    "VENDIDO",
+}
+
+PORTUGUESE_COMMON_HINTS = {
+    "COMO",
+    "CONSEGUIR",
+    "DE",
+    "ESSA",
+    "ISSO",
+    "OBRIGADO",
+    "PARA",
+    "POR",
+    "TUDO",
+}
+
 
 @dataclass
 class SenderContext:
+    room_id: str = ""
+    sender_id: str = ""
     side: str = ""
     quantity: str = ""
     quantity_unit: str = ""
+    limit_price_low: str = ""
+    limit_price_high: str = ""
+    tickers: tuple[str, ...] = ()
+    last_updated: str = ""
+    active: bool = False
+
+
+class SessionStore:
+    def __init__(self, db_path: Path, timeout_minutes: int) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(db_path)
+        self.connection.row_factory = sqlite3.Row
+        self.timeout = timedelta(minutes=timeout_minutes)
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                room_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT '',
+                quantity TEXT NOT NULL DEFAULT '',
+                quantity_unit TEXT NOT NULL DEFAULT '',
+                limit_price_low TEXT NOT NULL DEFAULT '',
+                limit_price_high TEXT NOT NULL DEFAULT '',
+                tickers_json TEXT NOT NULL DEFAULT '[]',
+                last_updated TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (room_id, sender_id)
+            )
+            """
+        )
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(chat_sessions)").fetchall()
+        }
+        if "limit_price_low" not in columns:
+            self.connection.execute(
+                "ALTER TABLE chat_sessions ADD COLUMN limit_price_low TEXT NOT NULL DEFAULT ''"
+            )
+        if "limit_price_high" not in columns:
+            self.connection.execute(
+                "ALTER TABLE chat_sessions ADD COLUMN limit_price_high TEXT NOT NULL DEFAULT ''"
+            )
+        self.connection.commit()
+
+    def get(self, room_id: str, sender_id: str) -> SenderContext:
+        row = self.connection.execute(
+            "SELECT * FROM chat_sessions WHERE room_id = ? AND sender_id = ?",
+            (room_id, sender_id),
+        ).fetchone()
+        if row is None:
+            return SenderContext(room_id=room_id, sender_id=sender_id)
+
+        context = SenderContext(
+            room_id=row["room_id"],
+            sender_id=row["sender_id"],
+            side=row["side"],
+            quantity=row["quantity"],
+            quantity_unit=row["quantity_unit"],
+            limit_price_low=row["limit_price_low"],
+            limit_price_high=row["limit_price_high"],
+            tickers=tuple(json.loads(row["tickers_json"])),
+            last_updated=row["last_updated"],
+            active=bool(row["active"]),
+        )
+        if self.is_expired(context):
+            self.clear(room_id, sender_id)
+            return SenderContext(room_id=room_id, sender_id=sender_id)
+        return context
+
+    def save(self, context: SenderContext) -> None:
+        context.last_updated = datetime.now(timezone.utc).isoformat()
+        self.connection.execute(
+            """
+            INSERT INTO chat_sessions (
+                room_id, sender_id, side, quantity, quantity_unit,
+                limit_price_low, limit_price_high, tickers_json, last_updated, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(room_id, sender_id) DO UPDATE SET
+                side = excluded.side,
+                quantity = excluded.quantity,
+                quantity_unit = excluded.quantity_unit,
+                limit_price_low = excluded.limit_price_low,
+                limit_price_high = excluded.limit_price_high,
+                tickers_json = excluded.tickers_json,
+                last_updated = excluded.last_updated,
+                active = excluded.active
+            """,
+            (
+                context.room_id,
+                context.sender_id,
+                context.side,
+                context.quantity,
+                context.quantity_unit,
+                context.limit_price_low,
+                context.limit_price_high,
+                json.dumps(list(context.tickers)),
+                context.last_updated,
+                int(context.active),
+            ),
+        )
+        self.connection.commit()
+
+    def clear(self, room_id: str, sender_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM chat_sessions WHERE room_id = ? AND sender_id = ?",
+            (room_id, sender_id),
+        )
+        self.connection.commit()
+
+    def is_expired(self, context: SenderContext) -> bool:
+        if not context.active or not context.last_updated:
+            return True
+        try:
+            updated = datetime.fromisoformat(context.last_updated)
+        except ValueError:
+            return True
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - updated > self.timeout
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 class NlpEngine:
@@ -224,6 +436,48 @@ class NlpEngine:
             if keys & self.sell_keys:
                 return "SELL"
         return ""
+
+
+class MessageTranslator:
+    def __init__(self, retries: int = 3) -> None:
+        self.cache: dict[str, tuple[str, str, str]] = {}
+        self.retries = retries
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError as exc:
+            raise SystemExit("Install mandatory translation support: pip install deep-translator") from exc
+        self.translator: Any = GoogleTranslator(source="pt", target="en")
+
+    @staticmethod
+    def looks_portuguese(message: str, nlp: NlpEngine) -> bool:
+        tokens = set(nlp.normalized_tokens(message))
+        if tokens & PORTUGUESE_STRONG_HINTS:
+            return True
+        return len(tokens & PORTUGUESE_COMMON_HINTS) >= 2
+
+    def translate(self, message: str, nlp: NlpEngine) -> tuple[str, str, str]:
+        if message in self.cache:
+            return self.cache[message]
+        if not self.looks_portuguese(message, nlp):
+            result = (message, "en_or_unknown", "not_needed")
+            self.cache[message] = result
+            return result
+
+        result = (message, "pt", "translation_error:unknown")
+        for attempt in range(1, self.retries + 1):
+            try:
+                translated = str(self.translator.translate(message)).strip()
+                if translated and translated.casefold() != message.casefold():
+                    result = (translated, "pt", "translated")
+                    break
+                result = (message, "pt", "translation_error:unchanged")
+            except Exception as exc:
+                result = (message, "pt", f"translation_error:{type(exc).__name__}")
+            if attempt < self.retries:
+                time.sleep(0.5 * attempt)
+
+        self.cache[message] = result
+        return result
 
 
 def normalize(value: str) -> str:
@@ -301,6 +555,60 @@ def detect_quantity(message: str, tickers: list[str] | None = None) -> tuple[str
     return bare_match.group("num").replace(",", ""), ""
 
 
+def detect_limit_price(message: str) -> tuple[str, str]:
+    for pattern in LIMIT_RANGE_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            low = match.group("low")
+            high = match.group("high")
+            if float(low) > float(high):
+                low, high = high, low
+            return low, high
+
+    for pattern in LIMIT_SINGLE_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            price = match.group("price")
+            return price, price
+
+    return "", ""
+
+
+def parse_compact_order_legs(message: str, symbol_set: set[str]) -> list[dict[str, str]]:
+    normalized_message = re.sub(
+        r"(?<=\d)(?=(?:B|S)\s*\d)",
+        " ",
+        message,
+        flags=re.IGNORECASE,
+    )
+    legs: list[dict[str, str]] = []
+
+    for match in COMPACT_ORDER_RE.finditer(normalized_message):
+        ticker = normalize(match.group("ticker"))
+        if ticker not in symbol_set:
+            continue
+
+        side_token = match.group("side").upper()
+        side = "BUY" if side_token in {"B", "BUY", "BOUGHT"} else "SELL"
+        quantity = match.group("quantity").replace(",", ".")
+        unit = (match.group("unit") or "").lower()
+        price = match.group("price") or ""
+
+        legs.append(
+            {
+                "ticker": ticker,
+                "side": side,
+                "quantity": quantity,
+                "quantity_unit": unit,
+                "limit_price_low": price,
+                "limit_price_high": price,
+                "price_type": "EXECUTED_PRICE" if price else "MARKET_OR_UNSPECIFIED",
+            }
+        )
+
+    return legs
+
+
 def fuzzy_symbol(token: str, symbol_set: set[str], threshold: float) -> str:
     best_symbol = ""
     best_score = 0.0
@@ -317,9 +625,13 @@ def fuzzy_symbol(token: str, symbol_set: set[str], threshold: float) -> str:
 def extract_symbols(message: str, symbol_set: set[str], fuzzy_threshold: float, nlp: NlpEngine) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
+    command_words = {
+        normalize(term)
+        for term in BUY_TERMS | SELL_TERMS | RELOAD_TERMS
+    }
     for raw in nlp.tokens(message):
         token = normalize(raw.removeprefix("$"))
-        if len(token) < 2 or token in STOPWORDS:
+        if len(token) < 2 or token in STOPWORDS or token in command_words:
             continue
         symbol = token if token in symbol_set else fuzzy_symbol(token, symbol_set, fuzzy_threshold)
         if symbol and symbol not in seen:
@@ -356,7 +668,7 @@ def is_context_continuation(message: str, tickers: list[str], nlp: NlpEngine) ->
     return "same for" in lowered or "each of" in lowered or "on top of prior" in lowered
 
 
-def sender_key(event: dict[str, Any]) -> str:
+def event_sender_id(event: dict[str, Any]) -> str:
     return str(
         event.get("sender_id")
         or event.get("participant_id")
@@ -366,29 +678,97 @@ def sender_key(event: dict[str, Any]) -> str:
     )
 
 
+def event_room_id(event: dict[str, Any]) -> str:
+    return str(
+        event.get("room_id")
+        or event.get("chat_id")
+        or event.get("room_name")
+        or event.get("room")
+        or "UNKNOWN_ROOM"
+    )
+
+
+def normalized_phrase(message: str, nlp: NlpEngine) -> str:
+    return " ".join(nlp.normalized_tokens(message))
+
+
+def is_reset_message(message: str, nlp: NlpEngine) -> bool:
+    return normalized_phrase(message, nlp) in RESET_PHRASES
+
+
+def is_reload_message(message: str, nlp: NlpEngine) -> bool:
+    return bool(set(nlp.normalized_tokens(message)) & RELOAD_TERMS)
+
+
 def build_output_row(
     event: dict[str, Any],
     original_message: str,
+    translated_message: str,
+    detected_language: str,
+    translation_status: str,
     side: str,
     quantity: str,
     quantity_unit: str,
     tickers: list[str],
     context_applied: bool,
+    limit_price_low: str = "",
+    limit_price_high: str = "",
+    intent_type: str = "NEW_ORDER",
+    confidence: float = 0.95,
+    processing_status: str = "accepted",
+    review_reason: str = "",
 ) -> dict[str, str]:
     quantity_text = f"{quantity}{quantity_unit}" if quantity and quantity_unit else quantity
-    normalized_instruction = " ".join(part for part in [side, quantity_text, " ".join(tickers)] if part)
+    if limit_price_low and limit_price_high and limit_price_low != limit_price_high:
+        limit_text = f"LIMIT {limit_price_low}-{limit_price_high}"
+        price_type = "LIMIT_RANGE"
+    elif limit_price_low:
+        limit_text = f"LIMIT {limit_price_low}"
+        price_type = "LIMIT"
+    else:
+        limit_text = ""
+        price_type = "MARKET_OR_UNSPECIFIED"
+
+    normalized_instruction = " ".join(
+        part for part in [side, quantity_text, " ".join(tickers), limit_text] if part
+    )
+    orders = [
+        {
+            "ticker": ticker,
+            "side": side,
+            "quantity": quantity,
+            "quantity_unit": quantity_unit,
+            "limit_price_low": limit_price_low,
+            "limit_price_high": limit_price_high,
+            "price_type": price_type,
+        }
+        for ticker in tickers
+    ]
     return {
         "captured_at": str(event.get("captured_at") or ""),
         "source_timestamp": str(event.get("source_timestamp") or ""),
-        "sender_id": str(event.get("sender_id") or event.get("participant_id") or ""),
+        "room_id": event_room_id(event),
+        "sender_id": event_sender_id(event),
         "sender_name": str(event.get("sender_name") or event.get("sender") or ""),
+        "session_key": f"{event_room_id(event)}:{event_sender_id(event)}",
         "message": normalized_instruction,
         "original_message": original_message,
+        "translated_message": translated_message,
+        "detected_language": detected_language,
+        "translation_status": translation_status,
         "trade_side": side,
         "quantity": quantity,
         "quantity_unit": quantity_unit,
+        "limit_price_low": limit_price_low,
+        "limit_price_high": limit_price_high,
+        "price_type": price_type,
         "candidate_tickers": "|".join(tickers),
+        "orders_json": json.dumps(orders, ensure_ascii=False),
         "context_applied": str(context_applied),
+        "intent_type": intent_type,
+        "confidence": f"{confidence:.2f}",
+        "processing_status": processing_status,
+        "review_reason": review_reason,
         "source_row_num": str(event.get("source_row_num") or event.get("row_num") or ""),
     }
 
@@ -397,59 +777,256 @@ def output_fields() -> list[str]:
     return [
         "captured_at",
         "source_timestamp",
+        "room_id",
         "sender_id",
         "sender_name",
+        "session_key",
         "message",
         "original_message",
+        "translated_message",
+        "detected_language",
+        "translation_status",
         "trade_side",
         "quantity",
         "quantity_unit",
+        "limit_price_low",
+        "limit_price_high",
+        "price_type",
         "candidate_tickers",
+        "orders_json",
         "context_applied",
+        "intent_type",
+        "confidence",
+        "processing_status",
+        "review_reason",
         "source_row_num",
     ]
+
+
+def build_review_row(
+    event: dict[str, Any],
+    original_message: str,
+    translated_message: str,
+    detected_language: str,
+    translation_status: str,
+    reason: str,
+) -> dict[str, str]:
+    return build_output_row(
+        event,
+        original_message,
+        translated_message,
+        detected_language,
+        translation_status,
+        "",
+        "",
+        "",
+        [],
+        False,
+        intent_type="REVIEW",
+        confidence=0.0,
+        processing_status="review",
+        review_reason=reason,
+    )
+
+
+def build_multi_leg_row(
+    event: dict[str, Any],
+    original_message: str,
+    translated_message: str,
+    detected_language: str,
+    translation_status: str,
+    legs: list[dict[str, str]],
+) -> dict[str, str]:
+    tickers = [leg["ticker"] for leg in legs]
+    row = build_output_row(
+        event,
+        original_message,
+        translated_message,
+        detected_language,
+        translation_status,
+        "MIXED",
+        "",
+        "",
+        tickers,
+        False,
+        intent_type="MULTI_LEG_EXECUTION",
+        confidence=0.99,
+    )
+    row["message"] = " | ".join(
+        " ".join(
+            part
+            for part in [
+                leg["side"],
+                f'{leg["quantity"]}{leg["quantity_unit"]}',
+                leg["ticker"],
+                f'@ {leg["limit_price_low"]}' if leg["limit_price_low"] else "",
+            ]
+            if part
+        )
+        for leg in legs
+    )
+    row["trade_side"] = "MIXED"
+    row["quantity"] = ""
+    row["quantity_unit"] = ""
+    row["limit_price_low"] = ""
+    row["limit_price_high"] = ""
+    row["price_type"] = "MULTI_LEG_EXECUTION"
+    row["orders_json"] = json.dumps(legs, ensure_ascii=False)
+    return row
 
 
 def process_one_event(
     event: dict[str, Any],
     symbol_set: set[str],
-    contexts: dict[str, SenderContext],
+    sessions: SessionStore,
     keep_unmatched_intent: bool,
     fuzzy_threshold: float,
     nlp: NlpEngine,
+    translator: MessageTranslator,
 ) -> dict[str, str] | None:
     message = clean_message(event.get("message"))
-    if not message or is_noise(message, nlp):
+    if not message:
         return None
 
-    key = sender_key(event)
-    context = contexts.setdefault(key, SenderContext())
+    translated_message, detected_language, translation_status = translator.translate(message, nlp)
+    if detected_language == "pt" and translation_status != "translated":
+        return build_review_row(
+            event,
+            message,
+            translated_message,
+            detected_language,
+            translation_status,
+            "mandatory_portuguese_translation_failed",
+        )
 
-    side = nlp.detect_side(message)
+    if is_noise(message, nlp) or (
+        translated_message != message and is_noise(translated_message, nlp)
+    ):
+        return None
+
+    room_id = event_room_id(event)
+    sender_id = event_sender_id(event)
+    context = sessions.get(room_id, sender_id)
+
+    if is_reset_message(translated_message, nlp):
+        sessions.clear(room_id, sender_id)
+        return None
+
+    compact_legs = parse_compact_order_legs(message, symbol_set)
+    if len(compact_legs) >= 2:
+        return build_multi_leg_row(
+            event,
+            message,
+            translated_message,
+            detected_language,
+            translation_status,
+            compact_legs,
+        )
+
+    side = nlp.detect_side(translated_message) or nlp.detect_side(message)
     tickers = extract_symbols(message, symbol_set, fuzzy_threshold, nlp)
     quantity, quantity_unit = detect_quantity(message, tickers)
+    limit_price_low, limit_price_high = detect_limit_price(translated_message)
+    reload_requested = is_reload_message(translated_message, nlp)
 
-    has_explicit_intent = bool(side or quantity)
-    can_use_context = bool(context.side and context.quantity) and is_context_continuation(message, tickers, nlp)
+    if reload_requested:
+        reload_tickers = tickers or list(context.tickers)
+        reload_quantity = quantity or context.quantity
+        reload_unit = quantity_unit if quantity else context.quantity_unit
+        reload_limit_low = limit_price_low or context.limit_price_low
+        reload_limit_high = limit_price_high or context.limit_price_high
+        if not context.active or not reload_tickers or not reload_quantity:
+            return build_review_row(
+                event,
+                message,
+                translated_message,
+                detected_language,
+                translation_status,
+                "reload_without_prior_active_order",
+            )
+
+        context.side = "BUY"
+        context.quantity = reload_quantity
+        context.quantity_unit = reload_unit
+        context.limit_price_low = reload_limit_low
+        context.limit_price_high = reload_limit_high
+        context.tickers = tuple(reload_tickers)
+        context.active = True
+        sessions.save(context)
+        return build_output_row(
+            event,
+            message,
+            translated_message,
+            detected_language,
+            translation_status,
+            "BUY",
+            reload_quantity,
+            reload_unit,
+            reload_tickers,
+            True,
+            limit_price_low=reload_limit_low,
+            limit_price_high=reload_limit_high,
+            intent_type="RELOAD",
+            confidence=0.96,
+        )
+
+    has_explicit_intent = bool(side or quantity or limit_price_low)
+    can_use_context = bool(context.side and context.quantity) and is_context_continuation(
+        translated_message,
+        tickers,
+        nlp,
+    )
 
     if has_explicit_intent and tickers:
         final_side = side or context.side
         final_quantity = quantity or context.quantity
         final_unit = quantity_unit if quantity else context.quantity_unit
+        final_limit_low = limit_price_low or context.limit_price_low
+        final_limit_high = limit_price_high or context.limit_price_high
         context.side = final_side
         context.quantity = final_quantity
         context.quantity_unit = final_unit
-        return build_output_row(event, message, final_side, final_quantity, final_unit, tickers, False)
-
-    if tickers and can_use_context:
+        context.limit_price_low = final_limit_low
+        context.limit_price_high = final_limit_high
+        context.tickers = tuple(tickers)
+        context.active = True
+        sessions.save(context)
         return build_output_row(
             event,
             message,
+            translated_message,
+            detected_language,
+            translation_status,
+            final_side,
+            final_quantity,
+            final_unit,
+            tickers,
+            False,
+            limit_price_low=final_limit_low,
+            limit_price_high=final_limit_high,
+            intent_type="NEW_ORDER",
+            confidence=0.98 if side and quantity else 0.92,
+        )
+
+    if tickers and can_use_context:
+        context.tickers = tuple(tickers)
+        context.active = True
+        sessions.save(context)
+        return build_output_row(
+            event,
+            message,
+            translated_message,
+            detected_language,
+            translation_status,
             context.side,
             context.quantity,
             context.quantity_unit,
             tickers,
             True,
+            limit_price_low=context.limit_price_low,
+            limit_price_high=context.limit_price_high,
+            intent_type="CONTINUATION",
+            confidence=0.90,
         )
 
     if has_explicit_intent and not tickers:
@@ -458,29 +1035,54 @@ def process_one_event(
         if quantity:
             context.quantity = quantity
             context.quantity_unit = quantity_unit
+        if limit_price_low:
+            context.limit_price_low = limit_price_low
+            context.limit_price_high = limit_price_high
+        context.active = bool(context.side and context.quantity)
+        sessions.save(context)
         if not keep_unmatched_intent:
             return None
-        return build_output_row(event, message, side, quantity, quantity_unit, [], False)
+        return build_output_row(
+            event,
+            message,
+            translated_message,
+            detected_language,
+            translation_status,
+            side,
+            quantity,
+            quantity_unit,
+            [],
+            False,
+            limit_price_low=limit_price_low,
+            limit_price_high=limit_price_high,
+            intent_type="CONTEXT_SETUP",
+            confidence=0.88,
+        )
 
     return None
 
 
 def process_events(events: Iterable[dict[str, Any]], symbol_set: set[str], args: argparse.Namespace) -> list[dict[str, str]]:
-    contexts: dict[str, SenderContext] = {}
     output_rows: list[dict[str, str]] = []
     nlp = NlpEngine()
+    translator = MessageTranslator(args.translation_retries)
+    sessions = SessionStore(Path(args.session_db), args.session_timeout_minutes)
 
-    for event in events:
-        row = process_one_event(
-            event,
-            symbol_set,
-            contexts,
-            args.keep_unmatched_intent,
-            args.fuzzy_threshold,
-            nlp,
-        )
-        if row:
-            output_rows.append(row)
+    try:
+        for event in events:
+            row = process_one_event(
+                event,
+                symbol_set,
+                sessions,
+                args.keep_unmatched_intent,
+                args.fuzzy_threshold,
+                nlp,
+                translator,
+            )
+            if row:
+                output_rows.append(row)
+    finally:
+        sessions.close()
 
     return output_rows
 
@@ -489,18 +1091,30 @@ def write_rows(rows: list[dict[str, str]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "nlp_trade_intent_messages.csv"
     jsonl_path = output_dir / "nlp_trade_intent_messages.jsonl"
+    review_csv_path = output_dir / "nlp_trade_review.csv"
+    review_jsonl_path = output_dir / "nlp_trade_review.jsonl"
 
     with csv_path.open("w", encoding="utf-8", newline="") as csv_handle, jsonl_path.open(
         "w", encoding="utf-8"
-    ) as jsonl_handle:
+    ) as jsonl_handle, review_csv_path.open(
+        "w", encoding="utf-8", newline=""
+    ) as review_csv_handle, review_jsonl_path.open("w", encoding="utf-8") as review_jsonl_handle:
         writer = csv.DictWriter(csv_handle, fieldnames=output_fields())
+        review_writer = csv.DictWriter(review_csv_handle, fieldnames=output_fields())
         writer.writeheader()
+        review_writer.writeheader()
         for row in rows:
-            writer.writerow(row)
-            jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if row["processing_status"] == "review":
+                review_writer.writerow(row)
+                review_jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            else:
+                writer.writerow(row)
+                jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"NLP trade intent CSV:   {csv_path}")
     print(f"NLP trade intent JSONL: {jsonl_path}")
+    print(f"NLP review CSV:         {review_csv_path}")
+    print(f"NLP review JSONL:       {review_jsonl_path}")
 
 
 def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespace) -> None:
@@ -511,51 +1125,77 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "nlp_trade_intent_messages.csv"
     jsonl_path = output_dir / "nlp_trade_intent_messages.jsonl"
+    review_csv_path = output_dir / "nlp_trade_review.csv"
+    review_jsonl_path = output_dir / "nlp_trade_review.jsonl"
     write_header = not csv_path.exists()
-    contexts: dict[str, SenderContext] = {}
+    write_review_header = not review_csv_path.exists()
     nlp = NlpEngine()
+    translator = MessageTranslator(args.translation_retries)
+    sessions = SessionStore(Path(args.session_db), args.session_timeout_minutes)
 
     print(f"Following chat JSONL: {input_path}")
     print(f"NLP trade intent CSV:   {csv_path}")
     print(f"NLP trade intent JSONL: {jsonl_path}")
+    print(f"NLP review CSV:         {review_csv_path}")
+    print(f"NLP review JSONL:       {review_jsonl_path}")
 
     while not input_path.exists():
         print(f"Waiting for input file: {input_path}", flush=True)
         time.sleep(args.poll_interval)
 
-    with input_path.open("r", encoding="utf-8") as input_handle, csv_path.open(
-        "a", encoding="utf-8", newline=""
-    ) as csv_handle, jsonl_path.open("a", encoding="utf-8") as jsonl_handle:
-        writer = csv.DictWriter(csv_handle, fieldnames=output_fields())
-        if write_header:
-            writer.writeheader()
+    try:
+        with input_path.open("r", encoding="utf-8") as input_handle, csv_path.open(
+            "a", encoding="utf-8", newline=""
+        ) as csv_handle, jsonl_path.open(
+            "a", encoding="utf-8"
+        ) as jsonl_handle, review_csv_path.open(
+            "a", encoding="utf-8", newline=""
+        ) as review_csv_handle, review_jsonl_path.open(
+            "a", encoding="utf-8"
+        ) as review_jsonl_handle:
+            writer = csv.DictWriter(csv_handle, fieldnames=output_fields())
+            review_writer = csv.DictWriter(review_csv_handle, fieldnames=output_fields())
+            if write_header:
+                writer.writeheader()
+            if write_review_header:
+                review_writer.writeheader()
 
-        while True:
-            line = input_handle.readline()
-            if not line:
-                time.sleep(args.poll_interval)
-                continue
+            while True:
+                line = input_handle.readline()
+                if not line:
+                    time.sleep(args.poll_interval)
+                    continue
 
-            row = process_one_event(
-                json.loads(line),
-                symbol_set,
-                contexts,
-                args.keep_unmatched_intent,
-                args.fuzzy_threshold,
-                nlp,
-            )
-            if not row:
-                continue
+                row = process_one_event(
+                    json.loads(line),
+                    symbol_set,
+                    sessions,
+                    args.keep_unmatched_intent,
+                    args.fuzzy_threshold,
+                    nlp,
+                    translator,
+                )
+                if not row:
+                    continue
 
-            writer.writerow(row)
-            csv_handle.flush()
-            jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            jsonl_handle.flush()
-            print(
-                f'{row["source_timestamp"]} sender_id={row["sender_id"]} '
-                f'intent={row["message"]} original={row["original_message"]}',
-                flush=True,
-            )
+                if row["processing_status"] == "review":
+                    review_writer.writerow(row)
+                    review_csv_handle.flush()
+                    review_jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    review_jsonl_handle.flush()
+                else:
+                    writer.writerow(row)
+                    csv_handle.flush()
+                    jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    jsonl_handle.flush()
+                print(
+                    f'{row["source_timestamp"]} session={row["session_key"]} '
+                    f'status={row["processing_status"]} intent={row["message"]} '
+                    f'original={row["original_message"]}',
+                    flush=True,
+                )
+    finally:
+        sessions.close()
 
 
 def main() -> int:
@@ -566,6 +1206,13 @@ def main() -> int:
     parser.add_argument("--symbol-col", default="A", help="Column containing symbols")
     parser.add_argument("--symbol-skip-rows", type=int, default=0)
     parser.add_argument("--fuzzy-threshold", type=float, default=0.84)
+    parser.add_argument("--translation-retries", type=int, default=3)
+    parser.add_argument("--session-timeout-minutes", type=int, default=10)
+    parser.add_argument(
+        "--session-db",
+        default=str(Path(__file__).resolve().parent / "nlp_chat_sessions.sqlite3"),
+        help="SQLite database for persistent room-plus-user sessions",
+    )
     parser.add_argument("--keep-unmatched-intent", action="store_true")
     parser.add_argument("--follow", action="store_true", help="Continuously watch input JSONL")
     parser.add_argument("--poll-interval", type=float, default=1.0)
