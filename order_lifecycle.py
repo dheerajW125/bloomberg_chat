@@ -198,10 +198,27 @@ def timestamp_key(event: dict[str, Any]) -> str:
     return str(event.get("source_timestamp") or event.get("captured_at") or "")
 
 
+def jsonl_path(value: str) -> Path:
+    path = Path(value)
+    if path.suffix.lower() != ".jsonl":
+        raise argparse.ArgumentTypeError("input must be a .jsonl file")
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--client-intents", required=True)
-    parser.add_argument("--trader-events", required=True)
+    parser.add_argument(
+        "--client-intents",
+        required=True,
+        type=jsonl_path,
+        help="Accepted client order intents JSONL",
+    )
+    parser.add_argument(
+        "--trader-events",
+        required=True,
+        type=jsonl_path,
+        help="Normalized trader order events JSONL",
+    )
     parser.add_argument("--follow", action="store_true")
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument(
@@ -211,8 +228,8 @@ def main() -> int:
     args = parser.parse_args()
 
     store = OrderStore(Path(args.database))
-    client_path = Path(args.client_intents)
-    trader_path = Path(args.trader_events)
+    client_path = args.client_intents
+    trader_path = args.trader_events
     client_offset = trader_offset = 0
 
     while True:
