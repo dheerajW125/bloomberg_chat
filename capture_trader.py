@@ -4,11 +4,11 @@ Discover and persist trader IDs from raw group-chat events.
 
 This pipeline classifies message authors as:
   - trader
-  - automated
+  - client
   - unknown/review
 
-It accumulates evidence across messages, persists profiles in SQLite, and writes
-registries so known trader IDs do not need to be rediscovered on later runs.
+Automated content is classified at message level because automated and trader
+messages can share the same sender ID.
 
 Important: input must contain messages from all room participants, not only the
 known client IDs.
@@ -17,7 +17,6 @@ known client IDs.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import re
@@ -43,7 +42,10 @@ COMPACT_EXECUTION_RE = re.compile(
     r"[A-Z][A-Z0-9.\-]{0,9}(?:\s*(?:@|FOR|AT)\s*\d+(?:\.\d+)?)?",
     re.IGNORECASE,
 )
-URL_RE = re.compile(r"https?://|www\.|<GO>|{GO}", re.IGNORECASE)
+URL_RE = re.compile(
+    r"(?:https?|ftp|bloomberg)://|www\.|mailto:|<GO>|{GO}",
+    re.IGNORECASE,
+)
 NEWS_RE = re.compile(
     r"\b(?:research|news|report|reported|breaking|headline|earnings|outlook|"
     r"conference call|market update|morning note|closing note|rsvp|webinar|"
@@ -52,6 +54,13 @@ NEWS_RE = re.compile(
 )
 AUTOMATION_PREFIX_RE = re.compile(
     r"^\s*(?:\*|#|alert:|news:|research:|in \d+ mins?:|early movers|indications)",
+    re.IGNORECASE,
+)
+TRADER_DESK_REPLY_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?|np|no problem|see|working(?: on it)?|on it|done|filled|"
+    r"noted|copy|got it|will do|yes|yep|sure|thanks|thank you|tks|same for|"
+    r"we are good|good catch)(?:\W+(?:thanks|thank you|tks|yes|yep|"
+    r"sure|done|noted|np|no problem))*\W*$",
     re.IGNORECASE,
 )
 
@@ -69,7 +78,7 @@ DEFAULT_CLIENT_IDS = {
     "23586289",
 }
 CONVERSATIONAL_RE = re.compile(
-    r"^\s*(?:ok|okay|see|done|thanks|thank you|tks|yes|no|morning|hi|hello|"
+    r"^\s*(?:ok|okay|np|see|done|thanks|thank you|tks|yes|no|morning|hi|hello|"
     r"good catch|we are good|same for)\b",
     re.IGNORECASE,
 )
@@ -84,16 +93,13 @@ def clean(value: Any) -> str:
 
 
 def read_events(path: Path) -> Iterable[dict[str, Any]]:
-    if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
-        return
-
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        yield from csv.DictReader(handle)
+    if path.suffix.lower() != ".jsonl":
+        raise SystemExit("Input must be a JSONL file")
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
 
 def actor_id(event: dict[str, Any], field: str) -> str:
@@ -148,6 +154,14 @@ def classify_message(message: str) -> dict[str, Any]:
     has_news = bool(NEWS_RE.search(message))
     automation_prefix = bool(AUTOMATION_PREFIX_RE.search(message))
     conversational = bool(CONVERSATIONAL_RE.search(message))
+    desk_reply = bool(TRADER_DESK_REPLY_RE.fullmatch(message))
+    letters = [char for char in message if char.isalpha()]
+    uppercase_ratio = (
+        sum(char.isupper() for char in letters) / len(letters)
+        if letters
+        else 0.0
+    )
+    headline_style = length >= 30 and uppercase_ratio >= 0.72
 
     trader_score = 0.0
     automated_score = 0.0
@@ -175,15 +189,22 @@ def classify_message(message: str) -> dict[str, Any]:
         trader_score += 0.25
         reasons.append("short_conversation")
 
+    if desk_reply:
+        trader_score += 6
+        reasons.append("trader_desk_reply")
+
     if has_url:
-        automated_score += 5
+        automated_score += 12
         reasons.append("url_or_terminal_link")
     if automation_prefix:
-        automated_score += 4
+        automated_score += 8
         reasons.append("automation_prefix")
     if has_news:
         automated_score += 3
         reasons.append("news_or_research_language")
+    if headline_style:
+        automated_score += 5
+        reasons.append("headline_style")
     if length >= 300:
         automated_score += 5
         reasons.append("very_long_message")
@@ -194,11 +215,38 @@ def classify_message(message: str) -> dict[str, Any]:
         automated_score += 2
         reasons.append("article_style_text")
 
+    headline_is_automated = bool(
+        headline_style
+        and compact_legs == 0
+        and not (has_side and has_quantity)
+    )
+    news_text_is_automated = bool(
+        has_news
+        and length >= 50
+        and compact_legs == 0
+        and not (has_side and has_quantity)
+    )
+    message_is_automated = bool(
+        has_url
+        or automation_prefix
+        or headline_is_automated
+        or news_text_is_automated
+        or (length >= 160 and (has_news or len(words) >= 35))
+        or automated_score >= 8
+    )
+    message_is_trader = bool(
+        not message_is_automated
+        and (desk_reply or compact_legs >= 1 or (has_side and has_quantity))
+    )
+
     return {
         "trader_score": trader_score,
         "automated_score": automated_score,
-        "trade_evidence": int(trader_score >= 4),
-        "automated_evidence": int(automated_score >= 4),
+        "trade_evidence": int(message_is_trader),
+        "automated_evidence": int(message_is_automated),
+        "message_is_trader": message_is_trader,
+        "message_is_automated": message_is_automated,
+        "desk_reply": desk_reply,
         "reasons": reasons,
     }
 
@@ -294,13 +342,19 @@ class RegistryStore:
         profile["last_room_id"] = event_room_id
         profile["last_reason"] = "|".join(evidence["reasons"])
 
-        if not profile["locked"]:
-            if author_id in self.client_ids:
-                profile["classification"] = "client"
+        if author_id in self.client_ids:
+            profile["classification"] = "client"
+            profile["locked"] = 1
+        else:
+            # Non-client actors may post both desk replies and automated/news
+            # content, so automation is classified only at message level.
+            profile["locked"] = 0
+            if evidence["message_is_trader"]:
+                profile["classification"] = "trader"
             else:
-                profile["classification"] = self._classification(profile)
-            if profile["classification"] in {"trader", "automated", "client"}:
-                profile["locked"] = 1
+                inferred = self._classification(profile)
+                if profile["classification"] != "trader":
+                    profile["classification"] = inferred
 
         self.connection.execute(
             """
@@ -350,21 +404,12 @@ class RegistryStore:
 
     def _classification(self, profile: dict[str, Any]) -> str:
         trader_margin = profile["trader_score"] - profile["automated_score"]
-        automated_margin = profile["automated_score"] - profile["trader_score"]
-
         if (
             profile["trade_message_count"] >= self.min_trade_messages
             and profile["trader_score"] >= self.trader_threshold
             and trader_margin >= 4
         ):
             return "trader"
-
-        if (
-            profile["automated_message_count"] >= 2
-            and profile["automated_score"] >= self.automated_threshold
-            and automated_margin >= 5
-        ):
-            return "automated"
 
         return "unknown"
 
@@ -379,22 +424,6 @@ class RegistryStore:
 
 
 class OutputWriter:
-    FIELDS = [
-        "actor_id",
-        "actor_name",
-        "classification",
-        "locked",
-        "message_count",
-        "trade_message_count",
-        "automated_message_count",
-        "trader_score",
-        "automated_score",
-        "first_seen",
-        "last_seen",
-        "last_room_id",
-        "last_reason",
-    ]
-
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +431,13 @@ class OutputWriter:
         self.automated_jsonl = output_dir / "automated_messages.jsonl"
         self.client_jsonl = output_dir / "client_messages.jsonl"
         self.review_jsonl = output_dir / "trader_classification_review.jsonl"
+        for path in (
+            self.trader_jsonl,
+            self.automated_jsonl,
+            self.client_jsonl,
+            self.review_jsonl,
+        ):
+            path.touch(exist_ok=True)
 
     def append_event(
         self,
@@ -414,6 +450,7 @@ class OutputWriter:
             **event,
             "actor_id": profile["actor_id"],
             "actor_classification": profile["classification"],
+            "message_classification": self.message_classification(profile, evidence),
             "actor_trader_score": profile["trader_score"],
             "actor_automated_score": profile["automated_score"],
             "classification_reasons": evidence["reasons"],
@@ -424,44 +461,22 @@ class OutputWriter:
             "automated": self.automated_jsonl,
             "client": self.client_jsonl,
             "unknown": self.review_jsonl,
-        }[profile["classification"]]
+        }[enriched["message_classification"]]
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(enriched, ensure_ascii=False) + "\n")
 
-    def export_registries(self, profiles: list[dict[str, Any]]) -> None:
-        self._write_csv(
-            self.output_dir / "trader_registry.csv",
-            [profile for profile in profiles if profile["classification"] == "trader"],
-        )
-        self._write_csv(
-            self.output_dir / "automated_registry.csv",
-            [profile for profile in profiles if profile["classification"] == "automated"],
-        )
-        self._write_csv(
-            self.output_dir / "client_registry.csv",
-            [profile for profile in profiles if profile["classification"] == "client"],
-        )
-        self._write_csv(
-            self.output_dir / "actor_review_registry.csv",
-            [profile for profile in profiles if profile["classification"] == "unknown"],
-        )
-
-        trader_ids = [
-            profile["actor_id"]
-            for profile in profiles
-            if profile["classification"] == "trader"
-        ]
-        (self.output_dir / "trader_ids.json").write_text(
-            json.dumps(trader_ids, indent=2),
-            encoding="utf-8",
-        )
-
-    def _write_csv(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=self.FIELDS)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({field: row.get(field, "") for field in self.FIELDS})
+    @staticmethod
+    def message_classification(
+        profile: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> str:
+        if profile["classification"] == "client":
+            return "client"
+        if evidence["message_is_automated"]:
+            return "automated"
+        if evidence["message_is_trader"] or profile["classification"] == "trader":
+            return "trader"
+        return "unknown"
 
 
 def process_event(
@@ -483,9 +498,10 @@ def process_event(
     profile = store.update(author_id, actor_name(event), room_id(event), evidence)
     store.mark_processed(key)
     writer.append_event(event, profile, evidence, message)
-    writer.export_registries(store.profiles())
+    message_class = writer.message_classification(profile, evidence)
     print(
-        f'actor_id={author_id} class={profile["classification"]} '
+        f'actor_id={author_id} actor_class={profile["classification"]} '
+        f'message_class={message_class} '
         f'trader_score={profile["trader_score"]:.2f} '
         f'automated_score={profile["automated_score"]:.2f} message={message}',
         flush=True,
@@ -498,7 +514,6 @@ def run_batch(args: argparse.Namespace, store: RegistryStore, writer: OutputWrit
     for event in read_events(Path(args.input)):
         if process_event(event, args.actor_id_field, store, writer):
             count += 1
-    writer.export_registries(store.profiles())
     print(f"Processed new events: {count}")
 
 
@@ -529,9 +544,29 @@ def parse_ids(value: str) -> set[str]:
     return ids
 
 
+def rebuild_outputs(output_dir: Path, registry_db: Path) -> None:
+    for name in (
+        "client_messages.jsonl",
+        "trader_messages.jsonl",
+        "automated_messages.jsonl",
+        "trader_classification_review.jsonl",
+        # Remove exports produced by older versions of this pipeline.
+        "client_registry.csv",
+        "trader_registry.csv",
+        "automated_registry.csv",
+        "actor_review_registry.csv",
+        "trader_ids.json",
+    ):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+    if registry_db.exists():
+        registry_db.unlink()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Raw all-participant chat JSONL/CSV")
+    parser.add_argument("--input", required=True, help="Raw all-participant chat JSONL")
     parser.add_argument(
         "--actor-id-field",
         default="sender_id",
@@ -555,16 +590,26 @@ def main() -> int:
         "--registry-db",
         default=str(Path(__file__).resolve().parent / "trader_registry.sqlite3"),
     )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Clear this pipeline's four JSONL outputs and registry DB before reprocessing",
+    )
     args = parser.parse_args()
 
+    output_dir = Path(args.output_dir)
+    registry_db = Path(args.registry_db)
+    if args.rebuild:
+        rebuild_outputs(output_dir, registry_db)
+
     store = RegistryStore(
-        Path(args.registry_db),
+        registry_db,
         args.trader_threshold,
         args.automated_threshold,
         args.min_trade_messages,
         parse_ids(args.additional_client_ids),
     )
-    writer = OutputWriter(Path(args.output_dir))
+    writer = OutputWriter(output_dir)
     try:
         if args.follow:
             run_follow(args, store, writer)
