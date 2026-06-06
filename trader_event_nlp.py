@@ -8,7 +8,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 ACK_RE = re.compile(r"^\s*(?:ok|okay|see|working|on it|will do|got it|yes)\b", re.I)
@@ -28,14 +28,6 @@ def clean(value: Any) -> str:
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()
 
 
-def read_events(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
 def extract_tickers(message: str, symbols: set[str]) -> list[str]:
     found: list[str] = []
     for token in re.findall(r"\b[A-Za-z][A-Za-z0-9.\-]{1,9}\b", message):
@@ -46,11 +38,13 @@ def extract_tickers(message: str, symbols: set[str]) -> list[str]:
 
 
 def load_symbols(path: Path) -> set[str]:
+    if path.suffix.lower() not in {".xlsx", ".xls", ".xlsm"}:
+        raise SystemExit("--symbol-excel must be an Excel file (.xlsx, .xls, or .xlsm)")
     try:
         import pandas as pd
     except ImportError as exc:
         raise SystemExit("Install pandas/openpyxl: pip install pandas openpyxl") from exc
-    frame = pd.read_csv(path, header=None) if path.suffix.lower() == ".csv" else pd.read_excel(path, header=None)
+    frame = pd.read_excel(path, header=None)
     return {str(value).strip().upper() for value in frame.iloc[:, 0].dropna() if str(value).strip()}
 
 
