@@ -67,6 +67,11 @@ def jsonl_path(value: str) -> Path:
     return path
 
 
+def safe_filename(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean(value)).strip("._")
+    return name or "unknown"
+
+
 def actor_id(event: dict[str, Any], field: str) -> str:
     if field:
         return clean(event.get(field))
@@ -192,7 +197,7 @@ def read_new_events(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]
     if not path.exists():
         return [], offset
     events: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8-sig") as handle:
         handle.seek(offset)
         for line_number, line in enumerate(handle, 1):
             line = line.strip()
@@ -214,12 +219,19 @@ class ClientSessionMapper:
         client_ids: set[str],
         id_field: str,
         output: Path,
+        client_output_dir: Path | None,
+        side_output_dir: Path,
         active_window_minutes: float,
         emit_updates: bool,
     ) -> None:
         self.client_ids = client_ids
         self.id_field = id_field
         self.output = output
+        self.client_output_dir = client_output_dir
+        self.side_output_dir = side_output_dir
+        self.automated_jsonl = side_output_dir / "automated_messages.jsonl"
+        self.trader_review_jsonl = side_output_dir / "trader_classification_review.jsonl"
+        self.client_review_jsonl = side_output_dir / "client_messages_review.jsonl"
         self.active_window_seconds = active_window_minutes * 60
         self.emit_updates = emit_updates
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -227,6 +239,15 @@ class ClientSessionMapper:
         self.session_counter = 0
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.output.touch(exist_ok=True)
+        if self.client_output_dir is not None:
+            self.client_output_dir.mkdir(parents=True, exist_ok=True)
+        self.side_output_dir.mkdir(parents=True, exist_ok=True)
+        for path in (
+            self.automated_jsonl,
+            self.trader_review_jsonl,
+            self.client_review_jsonl,
+        ):
+            path.touch(exist_ok=True)
 
     def process(self, event: dict[str, Any]) -> bool:
         author_id = actor_id(event, self.id_field)
@@ -234,14 +255,38 @@ class ClientSessionMapper:
         if not author_id or not message:
             return False
         if URL_RE.search(message):
-            return False
+            self._write_side_stream(
+                self.automated_jsonl,
+                event,
+                author_id,
+                "automated",
+                "url_or_terminal_link",
+            )
+            return True
         if author_id in self.client_ids:
+            record = message_record(event, author_id, "client", self.id_field)
+            if not record["tickers"]:
+                self._write_side_stream(
+                    self.client_review_jsonl,
+                    event,
+                    author_id,
+                    "client_review",
+                    "client_message_without_ticker",
+                )
             session = self._start_session(event, author_id)
             self._write_update(session, "client_message")
             return True
 
-        session = self._select_session(event)
+        session, review_reason, candidates = self._select_session(event)
         if not session:
+            self._write_side_stream(
+                self.trader_review_jsonl,
+                event,
+                author_id,
+                "trader_review",
+                review_reason,
+                candidates,
+            )
             return False
         session["trader_messages"].append(
             message_record(event, author_id, "trader", self.id_field)
@@ -283,11 +328,14 @@ class ClientSessionMapper:
         self.active_sessions_by_room.setdefault(room, []).append(session_id)
         return session
 
-    def _select_session(self, event: dict[str, Any]) -> dict[str, Any] | None:
+    def _select_session(
+        self,
+        event: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str, list[dict[str, Any]]]:
         room = room_id(event)
         session_ids = self.active_sessions_by_room.get(room, [])
         if not session_ids:
-            return None
+            return None, "no_active_client_session_in_room", []
         message = message_text(event)
         message_tickers = extract_message_tickers(message)
         event_time = parse_time(timestamp(event))
@@ -298,12 +346,53 @@ class ClientSessionMapper:
             if self._is_active(self.sessions[session_id], event_time)
         ]
         if not active_sessions:
-            return None
+            return None, "no_active_client_session_in_time_window", []
         if message_tickers:
-            for session in reversed(active_sessions):
-                if message_tickers & set(session["tickers"]):
-                    return session
-        return active_sessions[-1]
+            matches = [
+                session
+                for session in reversed(active_sessions)
+                if message_tickers & set(session["tickers"])
+            ]
+            if len(matches) == 1:
+                return matches[0], "", []
+            if len(matches) > 1:
+                return None, "multiple_matching_client_sessions", matches
+            return None, "no_matching_client_session_for_ticker", active_sessions
+        return active_sessions[-1], "", []
+
+    @staticmethod
+    def _candidate_summary(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "session_id": session["session_id"],
+                "client_id": session["client_id"],
+                "room_id": session["room_id"],
+                "opened_at": session["opened_at"],
+                "updated_at": session["updated_at"],
+                "tickers": session["tickers"],
+            }
+            for session in reversed(sessions)
+        ]
+
+    def _write_side_stream(
+        self,
+        path: Path,
+        event: dict[str, Any],
+        author_id: str,
+        message_class: str,
+        reason: str,
+        candidate_sessions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        record = message_record(event, author_id, message_class, self.id_field)
+        output = {
+            **record,
+            "message_classification": message_class,
+            "review_reason": reason,
+            "candidate_sessions": self._candidate_summary(candidate_sessions or []),
+            "generated_at": utc_now(),
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(output, ensure_ascii=False) + "\n")
 
     def _is_active(self, session: dict[str, Any], event_time: datetime | None) -> bool:
         if self.active_window_seconds <= 0 or event_time is None:
@@ -314,9 +403,9 @@ class ClientSessionMapper:
         return (event_time - updated_at).total_seconds() <= self.active_window_seconds
 
     def _write_update(self, session: dict[str, Any], update_type: str) -> None:
-        if not self.emit_updates:
-            return
-        self._write(session, update_type)
+        if self.emit_updates:
+            self._write(session, update_type)
+        self._write_client_file(clean(session["client_id"]))
 
     def _write(self, session: dict[str, Any], update_type: str) -> None:
         output = {
@@ -333,6 +422,38 @@ class ClientSessionMapper:
             key=lambda item: (clean(item.get("opened_at")), item["session_sequence"]),
         ):
             self._write(session, "final_session")
+        self.write_client_files()
+
+    def write_client_files(self) -> None:
+        if self.client_output_dir is None:
+            return
+        client_ids = sorted(
+            {clean(session["client_id"]) for session in self.sessions.values()}
+        )
+        for client_id in client_ids:
+            self._write_client_file(client_id)
+
+    def _write_client_file(self, client_id: str) -> None:
+        if self.client_output_dir is None:
+            return
+        sessions = [
+            session
+            for session in self.sessions.values()
+            if clean(session["client_id"]) == client_id
+        ]
+        sessions.sort(key=lambda item: (clean(item.get("opened_at")), item["session_sequence"]))
+        document = {
+            "record_type": "client_chat_sessions_by_client",
+            "client_id": client_id,
+            "generated_at": utc_now(),
+            "session_count": len(sessions),
+            "sessions": sessions,
+        }
+        path = self.client_output_dir / f"{safe_filename(client_id)}.json"
+        path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def parse_client_ids(value: str) -> set[str]:
@@ -348,6 +469,21 @@ def main() -> int:
         "--output",
         type=jsonl_path,
         default=Path(__file__).resolve().parent / "client_chat_sessions.jsonl",
+    )
+    parser.add_argument(
+        "--client-output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "client_sessions_by_client",
+        help="Directory for one normal JSON file per client.",
+    )
+    parser.add_argument(
+        "--side-output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help=(
+            "Directory for automated_messages.jsonl, "
+            "trader_classification_review.jsonl, and client_messages_review.jsonl."
+        ),
     )
     parser.add_argument(
         "--client-ids",
@@ -384,11 +520,23 @@ def main() -> int:
     if not args.follow and not args.append:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text("", encoding="utf-8")
+        if args.client_output_dir.exists():
+            for path in args.client_output_dir.glob("*.json"):
+                path.unlink()
+        args.side_output_dir.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "automated_messages.jsonl",
+            "trader_classification_review.jsonl",
+            "client_messages_review.jsonl",
+        ):
+            (args.side_output_dir / name).write_text("", encoding="utf-8")
 
     mapper = ClientSessionMapper(
         parse_client_ids(args.client_ids),
         args.actor_id_field,
         args.output,
+        args.client_output_dir,
+        args.side_output_dir,
         args.active_window_minutes,
         args.follow or args.emit_updates,
     )
@@ -408,6 +556,8 @@ def main() -> int:
         mapper.write_final_sessions()
 
     print(f"Client session output: {args.output}")
+    print(f"Per-client JSON output: {args.client_output_dir}")
+    print(f"Side stream output: {args.side_output_dir}")
     print(f"Mapped messages: {processed}")
     return 0
 
