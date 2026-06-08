@@ -16,12 +16,26 @@ REJECT_RE = re.compile(r"\b(?:cannot|can't|unable|no liquidity|reject|decline)\b
 PARTIAL_RE = re.compile(r"\b(?P<pct>\d+(?:\.\d+)?)\s*%\s*(?:done|filled)\b", re.I)
 FILL_WORD_RE = re.compile(r"\b(?:bought|sold|filled|done)\b", re.I)
 SIDE_RE = re.compile(r"\b(?P<side>B|S|BUY|SELL|BOUGHT|SOLD)\b", re.I)
+URL_RE = re.compile(r"(?:https?|ftp|bloomberg)://|www\.|mailto:|<GO>|{GO}", re.I)
+NEWS_RE = re.compile(
+    r"\b(?:news|research|report|reported|headline|stake|takeover|m[&a]|"
+    r"acquisition|merger|analyst|rating|target|upgrade|downgrade|outperform|"
+    r"underperform|neutral|initiated|raised|lowered|pt|price target|reuters|"
+    r"bloomberg|cnbc|earnings|guidance|forecast|outlook|shares|stock|"
+    r"would|could|may|said|says|plans|expects|seeks|mulls|weighs)\b",
+    re.I,
+)
 QTY_TICKER_RE = re.compile(
     r"\b(?P<qty>\d+(?:[.,]\d+)?)\s*(?P<unit>k|m|mm|mn)?\s+"
     r"(?P<ticker>[A-Za-z][A-Za-z0-9.\-]{0,9})\b",
     re.I,
 )
 PRICE_RE = re.compile(r"(?:@|\bat\b|\bfor\b)\s*(?P<price>\d+(?:\.\d+)?)", re.I)
+COMPACT_EXECUTION_RE = re.compile(
+    r"\b(?:B|S|BUY|SELL|BOUGHT|SOLD)\s*\d+(?:[.,]\d+)?\s*(?:K|M|MM|MN)?\s+"
+    r"[A-Z][A-Z0-9.\-]{0,9}(?:\s*(?:@|FOR|AT)\s*\d+(?:\.\d+)?)?",
+    re.I,
+)
 
 
 def clean(value: Any) -> str:
@@ -48,6 +62,34 @@ def load_symbols(path: Path) -> set[str]:
     return {str(value).strip().upper() for value in frame.iloc[:, 0].dropna() if str(value).strip()}
 
 
+def is_automated_or_news_message(message: str) -> bool:
+    if URL_RE.search(message):
+        return True
+    words = message.split()
+    if NEWS_RE.search(message) and (len(words) >= 10 or not FILL_WORD_RE.search(message)):
+        return True
+    letters = [char for char in message if char.isalpha()]
+    uppercase_ratio = (
+        sum(char.isupper() for char in letters) / len(letters)
+        if letters
+        else 0.0
+    )
+    return len(message) >= 40 and uppercase_ratio >= 0.72
+
+
+def has_execution_evidence(message: str, tickers: list[str]) -> bool:
+    if not tickers:
+        return False
+    if COMPACT_EXECUTION_RE.search(message):
+        return True
+    if PRICE_RE.search(message) and SIDE_RE.search(message):
+        return True
+    if FILL_WORD_RE.search(message):
+        words = message.split()
+        return len(words) <= 8 or bool(QTY_TICKER_RE.search(message) or PRICE_RE.search(message))
+    return False
+
+
 def parse_event(event: dict[str, Any], symbols: set[str]) -> dict[str, Any] | None:
     message = clean(event.get("message"))
     room = clean(event.get("room_id") or event.get("chat_id") or event.get("room_name"))
@@ -59,6 +101,13 @@ def parse_event(event: dict[str, Any], symbols: set[str]) -> dict[str, Any] | No
         "trader_id": trader,
         "raw_message": message,
     }
+
+    if (
+        clean(event.get("message_classification")) == "automated"
+        or clean(event.get("actor_classification")) == "automated"
+        or is_automated_or_news_message(message)
+    ):
+        return None
 
     if REJECT_RE.search(message):
         return {**base, "event_type": "REJECT", "tickers": extract_tickers(message, symbols)}
@@ -73,7 +122,7 @@ def parse_event(event: dict[str, Any], symbols: set[str]) -> dict[str, Any] | No
         }
 
     tickers = extract_tickers(message, symbols)
-    if FILL_WORD_RE.search(message) or (SIDE_RE.search(message) and tickers):
+    if has_execution_evidence(message, tickers):
         quantity_match = QTY_TICKER_RE.search(message)
         price_match = PRICE_RE.search(message)
         side_match = SIDE_RE.search(message)
