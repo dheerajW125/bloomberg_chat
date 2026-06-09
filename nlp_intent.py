@@ -6,7 +6,8 @@ Purpose:
   - Filter out casual chat such as "hi", "hello", "hey mate".
   - Use NLTK tokenization/stemming to detect English and Portuguese trade intent.
   - Carry forward side/quantity context per sender.
-  - Output only trade-like messages for the ticker matching pipeline.
+  - Read per-client JSON session files or a chat JSONL stream.
+  - Output accepted intents and reviews as JSONL.
 
 Example:
   Sender says: "buy 10pc NVDA"
@@ -17,7 +18,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import re
 import sqlite3
@@ -497,39 +497,103 @@ def excel_col_to_index(col: str) -> int:
     return value - 1
 
 
-def load_symbol_set(file_path: Path, sheet: str | int, symbol_col: str, skip_rows: int) -> set[str]:
+def load_symbol_set(
+    file_path: Path,
+    sheet: str | int,
+    symbol_col: str,
+    skip_rows: int,
+) -> set[str]:
+    suffix = file_path.suffix.lower()
+    if suffix not in {".csv", ".xlsx", ".xls", ".xlsm"}:
+        raise SystemExit("Symbol file must be CSV or Excel (.csv, .xlsx, .xls, .xlsm)")
     try:
         import pandas as pd
     except ImportError as exc:
-        raise SystemExit("Symbol Excel source needs pandas/openpyxl: pip install pandas openpyxl") from exc
+        raise SystemExit("Symbol source needs pandas/openpyxl: pip install pandas openpyxl") from exc
 
-    if file_path.suffix.lower() == ".csv":
-        frame = pd.read_csv(file_path, header=None, skiprows=skip_rows)
+    if suffix == ".csv":
+        frame = pd.read_csv(file_path, header=None, skiprows=skip_rows, dtype=str)
     else:
-        frame = pd.read_excel(file_path, sheet_name=sheet, header=None, skiprows=skip_rows)
+        frame = pd.read_excel(
+            file_path,
+            sheet_name=sheet,
+            header=None,
+            skiprows=skip_rows,
+            dtype=str,
+        )
 
-    col_idx = excel_col_to_index(symbol_col)
+    requested = clean_message(symbol_col)
+    header_values = [
+        clean_message(value).casefold()
+        for value in frame.iloc[0].tolist()
+    ] if not frame.empty else []
+    requested_header = requested.casefold()
+    if requested_header in header_values:
+        col_idx = header_values.index(requested_header)
+        start_row = 1
+    elif requested_header == "symbol" and "symbol" in header_values:
+        col_idx = header_values.index("symbol")
+        start_row = 1
+    elif re.fullmatch(r"[A-Za-z]{1,3}", requested):
+        col_idx = excel_col_to_index(requested)
+        start_row = 1 if (
+            col_idx < len(header_values)
+            and header_values[col_idx] in {"symbol", "ticker"}
+        ) else 0
+    else:
+        raise SystemExit(
+            f"Symbol column '{symbol_col}' was not found. "
+            "Use a header name such as Symbol or an Excel column such as A."
+        )
+
     symbols: set[str] = set()
-    for _, row in frame.iterrows():
+    for _, row in frame.iloc[start_row:].iterrows():
         if col_idx >= len(row) or pd.isna(row.iloc[col_idx]):
             continue
         symbol = normalize(str(row.iloc[col_idx]).strip())
         if symbol:
             symbols.add(symbol)
+    if not symbols:
+        raise SystemExit(f"No symbols found in {file_path}")
     return symbols
 
 
-def read_events(path: Path) -> Iterable[dict[str, Any]]:
-    if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
-        return
+def client_document_events(path: Path) -> Iterable[dict[str, Any]]:
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
+    client_id = clean_message(document.get("client_id"))
+    client_name = clean_message(document.get("client_name"))
+    for session in document.get("sessions") or []:
+        session_id = clean_message(session.get("session_id"))
+        room_id = clean_message(session.get("room_id")) or "UNKNOWN_ROOM"
+        messages = session.get("messages") or session.get("client_messages") or []
+        for item in messages:
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            event = dict(raw)
+            event.setdefault("event_id", item.get("event_id"))
+            event.setdefault("source_timestamp", item.get("timestamp"))
+            event.setdefault("room_id", room_id)
+            event.setdefault("sender_id", item.get("sender_id") or client_id)
+            event.setdefault("sender_name", item.get("sender_name") or client_name)
+            event.setdefault("message", item.get("message"))
+            event["client_session_id"] = session_id
+            yield event
 
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        yield from csv.DictReader(handle)
+
+def read_events(path: Path) -> Iterable[dict[str, Any]]:
+    if path.is_dir():
+        for client_path in sorted(path.glob("*.json")):
+            yield from client_document_events(client_path)
+        return
+    if path.suffix.lower() == ".json":
+        yield from client_document_events(path)
+        return
+    if path.suffix.lower() != ".jsonl":
+        raise SystemExit("--input must be a client JSON directory, .json, or .jsonl")
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
 
 def detect_quantity(message: str, tickers: list[str] | None = None) -> tuple[str, str]:
@@ -745,12 +809,16 @@ def build_output_row(
         for ticker in tickers
     ]
     return {
+        "source_event_id": str(
+            event.get("event_id") or event.get("source_event_id") or ""
+        ),
         "captured_at": str(event.get("captured_at") or ""),
         "source_timestamp": str(event.get("source_timestamp") or ""),
         "room_id": event_room_id(event),
         "sender_id": event_sender_id(event),
         "sender_name": str(event.get("sender_name") or event.get("sender") or ""),
         "session_key": f"{event_room_id(event)}:{event_sender_id(event)}",
+        "client_session_id": str(event.get("client_session_id") or ""),
         "message": normalized_instruction,
         "original_message": original_message,
         "translated_message": translated_message,
@@ -775,12 +843,14 @@ def build_output_row(
 
 def output_fields() -> list[str]:
     return [
+        "source_event_id",
         "captured_at",
         "source_timestamp",
         "room_id",
         "sender_id",
         "sender_name",
         "session_key",
+        "client_session_id",
         "message",
         "original_message",
         "translated_message",
@@ -1089,31 +1159,19 @@ def process_events(events: Iterable[dict[str, Any]], symbol_set: set[str], args:
 
 def write_rows(rows: list[dict[str, str]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "nlp_trade_intent_messages.csv"
     jsonl_path = output_dir / "nlp_trade_intent_messages.jsonl"
-    review_csv_path = output_dir / "nlp_trade_review.csv"
     review_jsonl_path = output_dir / "nlp_trade_review.jsonl"
 
-    with csv_path.open("w", encoding="utf-8", newline="") as csv_handle, jsonl_path.open(
+    with jsonl_path.open("w", encoding="utf-8") as jsonl_handle, review_jsonl_path.open(
         "w", encoding="utf-8"
-    ) as jsonl_handle, review_csv_path.open(
-        "w", encoding="utf-8", newline=""
-    ) as review_csv_handle, review_jsonl_path.open("w", encoding="utf-8") as review_jsonl_handle:
-        writer = csv.DictWriter(csv_handle, fieldnames=output_fields())
-        review_writer = csv.DictWriter(review_csv_handle, fieldnames=output_fields())
-        writer.writeheader()
-        review_writer.writeheader()
+    ) as review_jsonl_handle:
         for row in rows:
             if row["processing_status"] == "review":
-                review_writer.writerow(row)
                 review_jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             else:
-                writer.writerow(row)
                 jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"NLP trade intent CSV:   {csv_path}")
     print(f"NLP trade intent JSONL: {jsonl_path}")
-    print(f"NLP review CSV:         {review_csv_path}")
     print(f"NLP review JSONL:       {review_jsonl_path}")
 
 
@@ -1123,20 +1181,14 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "nlp_trade_intent_messages.csv"
     jsonl_path = output_dir / "nlp_trade_intent_messages.jsonl"
-    review_csv_path = output_dir / "nlp_trade_review.csv"
     review_jsonl_path = output_dir / "nlp_trade_review.jsonl"
-    write_header = not csv_path.exists()
-    write_review_header = not review_csv_path.exists()
     nlp = NlpEngine()
     translator = MessageTranslator(args.translation_retries)
     sessions = SessionStore(Path(args.session_db), args.session_timeout_minutes)
 
     print(f"Following chat JSONL: {input_path}")
-    print(f"NLP trade intent CSV:   {csv_path}")
     print(f"NLP trade intent JSONL: {jsonl_path}")
-    print(f"NLP review CSV:         {review_csv_path}")
     print(f"NLP review JSONL:       {review_jsonl_path}")
 
     while not input_path.exists():
@@ -1144,22 +1196,11 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
         time.sleep(args.poll_interval)
 
     try:
-        with input_path.open("r", encoding="utf-8") as input_handle, csv_path.open(
-            "a", encoding="utf-8", newline=""
-        ) as csv_handle, jsonl_path.open(
+        with input_path.open("r", encoding="utf-8-sig") as input_handle, jsonl_path.open(
             "a", encoding="utf-8"
-        ) as jsonl_handle, review_csv_path.open(
-            "a", encoding="utf-8", newline=""
-        ) as review_csv_handle, review_jsonl_path.open(
+        ) as jsonl_handle, review_jsonl_path.open(
             "a", encoding="utf-8"
         ) as review_jsonl_handle:
-            writer = csv.DictWriter(csv_handle, fieldnames=output_fields())
-            review_writer = csv.DictWriter(review_csv_handle, fieldnames=output_fields())
-            if write_header:
-                writer.writeheader()
-            if write_review_header:
-                review_writer.writeheader()
-
             while True:
                 line = input_handle.readline()
                 if not line:
@@ -1179,13 +1220,9 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
                     continue
 
                 if row["processing_status"] == "review":
-                    review_writer.writerow(row)
-                    review_csv_handle.flush()
                     review_jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     review_jsonl_handle.flush()
                 else:
-                    writer.writerow(row)
-                    csv_handle.flush()
                     jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     jsonl_handle.flush()
                 print(
@@ -1198,12 +1235,121 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
         sessions.close()
 
 
+def follow_client_directory(
+    input_dir: Path,
+    symbol_set: set[str],
+    args: argparse.Namespace,
+) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / "nlp_trade_intent_messages.jsonl"
+    review_jsonl_path = output_dir / "nlp_trade_review.jsonl"
+    nlp = NlpEngine()
+    translator = MessageTranslator(args.translation_retries)
+    sessions = SessionStore(Path(args.session_db), args.session_timeout_minutes)
+    seen: set[str] = set()
+    for existing_path in (jsonl_path, review_jsonl_path):
+        if not existing_path.exists():
+            continue
+        with existing_path.open("r", encoding="utf-8-sig") as existing:
+            for line in existing:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                source_id = clean_message(row.get("source_event_id"))
+                if source_id:
+                    seen.add(
+                        "|".join(
+                            [
+                                clean_message(row.get("sender_id")),
+                                clean_message(row.get("room_id")),
+                                source_id,
+                            ]
+                        )
+                    )
+
+    print(f"Following client JSON directory: {input_dir}")
+    print(f"NLP trade intent JSONL: {jsonl_path}")
+    print(f"NLP review JSONL:       {review_jsonl_path}")
+
+    try:
+        with jsonl_path.open("a", encoding="utf-8") as jsonl_handle, review_jsonl_path.open(
+            "a", encoding="utf-8"
+        ) as review_jsonl_handle:
+            while True:
+                events = sorted(
+                    read_events(input_dir),
+                    key=lambda event: str(
+                        event.get("source_timestamp")
+                        or event.get("captured_at")
+                        or ""
+                    ),
+                )
+                for event in events:
+                    source_id = clean_message(
+                        event.get("event_id") or event.get("source_event_id")
+                    )
+                    key = "|".join(
+                        [
+                            event_sender_id(event),
+                            event_room_id(event),
+                            source_id,
+                        ]
+                    )
+                    if not source_id:
+                        key = json.dumps(event, sort_keys=True, ensure_ascii=False)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    row = process_one_event(
+                        event,
+                        symbol_set,
+                        sessions,
+                        args.keep_unmatched_intent,
+                        args.fuzzy_threshold,
+                        nlp,
+                        translator,
+                    )
+                    if not row:
+                        continue
+                    target = (
+                        review_jsonl_handle
+                        if row["processing_status"] == "review"
+                        else jsonl_handle
+                    )
+                    target.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    target.flush()
+                    print(
+                        f'{row["source_timestamp"]} client={row["sender_id"]} '
+                        f'session={row["client_session_id"]} '
+                        f'status={row["processing_status"]} intent={row["message"]}',
+                        flush=True,
+                    )
+                time.sleep(args.poll_interval)
+    finally:
+        sessions.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Raw/captured chat CSV or JSONL")
-    parser.add_argument("--symbol-excel", required=True, help="Excel/CSV with valid symbols")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Per-client JSON directory, one client JSON file, or chat JSONL",
+    )
+    parser.add_argument(
+        "--symbol-file",
+        "--symbol-excel",
+        dest="symbol_file",
+        required=True,
+        help="CSV or Excel symbol master containing a Symbol column",
+    )
     parser.add_argument("--symbol-sheet", default=0, help="Sheet name or zero-based index")
-    parser.add_argument("--symbol-col", default="A", help="Column containing symbols")
+    parser.add_argument(
+        "--symbol-col",
+        default="Symbol",
+        help="Symbol header name or Excel column letter (default: Symbol)",
+    )
     parser.add_argument("--symbol-skip-rows", type=int, default=0)
     parser.add_argument("--fuzzy-threshold", type=float, default=0.84)
     parser.add_argument("--translation-retries", type=int, default=3)
@@ -1214,7 +1360,11 @@ def main() -> int:
         help="SQLite database for persistent room-plus-user sessions",
     )
     parser.add_argument("--keep-unmatched-intent", action="store_true")
-    parser.add_argument("--follow", action="store_true", help="Continuously watch input JSONL")
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Continuously watch input JSONL or per-client JSON directory",
+    )
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument(
         "--output-dir",
@@ -1227,11 +1377,28 @@ def main() -> int:
     if isinstance(symbol_sheet, str) and symbol_sheet.isdigit():
         symbol_sheet = int(symbol_sheet)
 
-    symbols = load_symbol_set(Path(args.symbol_excel), symbol_sheet, args.symbol_col, args.symbol_skip_rows)
+    input_path = Path(args.input)
+    symbols = load_symbol_set(
+        Path(args.symbol_file),
+        symbol_sheet,
+        args.symbol_col,
+        args.symbol_skip_rows,
+    )
     if args.follow:
-        follow_jsonl(Path(args.input), symbols, args)
+        if input_path.is_dir():
+            follow_client_directory(input_path, symbols, args)
+        else:
+            follow_jsonl(input_path, symbols, args)
     else:
-        rows = process_events(read_events(Path(args.input)), symbols, args)
+        events = sorted(
+            read_events(input_path),
+            key=lambda event: str(
+                event.get("source_timestamp")
+                or event.get("captured_at")
+                or ""
+            ),
+        )
+        rows = process_events(events, symbols, args)
         write_rows(rows, Path(args.output_dir))
         print(f"Filtered trade-like messages: {len(rows)}")
     return 0
