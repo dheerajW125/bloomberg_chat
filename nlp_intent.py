@@ -488,6 +488,11 @@ def clean_message(value: Any) -> str:
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()
 
 
+def safe_filename(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean_message(value)).strip("._")
+    return name or "unknown"
+
+
 def excel_col_to_index(col: str) -> int:
     value = 0
     for char in col.strip().upper():
@@ -1175,6 +1180,72 @@ def write_rows(rows: list[dict[str, str]], output_dir: Path) -> None:
     print(f"NLP review JSONL:       {review_jsonl_path}")
 
 
+def write_client_intent_files(
+    rows: list[dict[str, str]],
+    client_output_dir: Path,
+) -> None:
+    client_output_dir.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(clean_message(row.get("sender_id")), []).append(row)
+
+    for client_id, client_rows in grouped.items():
+        accepted = [
+            row for row in client_rows if row["processing_status"] == "accepted"
+        ]
+        reviews = [
+            row for row in client_rows if row["processing_status"] == "review"
+        ]
+        document = {
+            "record_type": "client_trade_intents",
+            "client_id": client_id,
+            "client_name": next(
+                (
+                    clean_message(row.get("sender_name"))
+                    for row in client_rows
+                    if clean_message(row.get("sender_name"))
+                ),
+                "",
+            ),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "accepted_intent_count": len(accepted),
+            "review_message_count": len(reviews),
+            "accepted_intents": accepted,
+            "review_messages": reviews,
+        }
+        path = client_output_dir / f"{safe_filename(client_id)}.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+
+def upsert_client_intent_file(
+    row: dict[str, str],
+    client_output_dir: Path,
+) -> None:
+    client_id = clean_message(row.get("sender_id"))
+    path = client_output_dir / f"{safe_filename(client_id)}.json"
+    existing_rows: list[dict[str, str]] = []
+    if path.exists():
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+        existing_rows.extend(document.get("accepted_intents") or [])
+        existing_rows.extend(document.get("review_messages") or [])
+
+    source_event_id = clean_message(row.get("source_event_id"))
+    if any(
+        clean_message(item.get("source_event_id")) == source_event_id
+        and clean_message(item.get("client_session_id"))
+        == clean_message(row.get("client_session_id"))
+        for item in existing_rows
+    ):
+        return
+    existing_rows.append(row)
+    write_client_intent_files(existing_rows, client_output_dir)
+
+
 def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespace) -> None:
     if input_path.suffix.lower() != ".jsonl":
         raise SystemExit("--follow expects JSONL input")
@@ -1225,6 +1296,7 @@ def follow_jsonl(input_path: Path, symbol_set: set[str], args: argparse.Namespac
                 else:
                     jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     jsonl_handle.flush()
+                upsert_client_intent_file(row, Path(args.client_output_dir))
                 print(
                     f'{row["source_timestamp"]} session={row["session_key"]} '
                     f'status={row["processing_status"]} intent={row["message"]} '
@@ -1319,6 +1391,7 @@ def follow_client_directory(
                     )
                     target.write(json.dumps(row, ensure_ascii=False) + "\n")
                     target.flush()
+                    upsert_client_intent_file(row, Path(args.client_output_dir))
                     print(
                         f'{row["source_timestamp"]} client={row["sender_id"]} '
                         f'session={row["client_session_id"]} '
@@ -1371,7 +1444,19 @@ def main() -> int:
         default=str(Path(__file__).resolve().parent),
         help="Folder where NLP-filtered files are saved",
     )
+    parser.add_argument(
+        "--client-output-dir",
+        default="",
+        help=(
+            "Directory for one NLP JSON file per client. "
+            "Defaults to <output-dir>/client_intents_by_client."
+        ),
+    )
     args = parser.parse_args()
+    if not args.client_output_dir:
+        args.client_output_dir = str(
+            Path(args.output_dir) / "client_intents_by_client"
+        )
 
     symbol_sheet: str | int = args.symbol_sheet
     if isinstance(symbol_sheet, str) and symbol_sheet.isdigit():
@@ -1400,6 +1485,12 @@ def main() -> int:
         )
         rows = process_events(events, symbols, args)
         write_rows(rows, Path(args.output_dir))
+        client_output_dir = Path(args.client_output_dir)
+        client_output_dir.mkdir(parents=True, exist_ok=True)
+        for path in client_output_dir.glob("*.json"):
+            path.unlink()
+        write_client_intent_files(rows, client_output_dir)
+        print(f"Per-client NLP output:  {client_output_dir}")
         print(f"Filtered trade-like messages: {len(rows)}")
     return 0
 
