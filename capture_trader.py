@@ -92,10 +92,24 @@ def clean(value: Any) -> str:
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()
 
 
+def safe_filename(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", clean(value)).strip("._")
+    return name or "unknown"
+
+
+def event_timestamp(event: dict[str, Any]) -> str:
+    return clean(
+        event.get("source_timestamp")
+        or event.get("captured_at")
+        or event.get("created_at")
+        or event.get("timestamp")
+    )
+
+
 def read_events(path: Path) -> Iterable[dict[str, Any]]:
     if path.suffix.lower() != ".jsonl":
         raise SystemExit("Input must be a JSONL file")
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8-sig") as handle:
         for line in handle:
             line = line.strip()
             if line:
@@ -424,9 +438,11 @@ class RegistryStore:
 
 
 class OutputWriter:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, client_session_dir: Path) -> None:
         self.output_dir = output_dir
+        self.client_session_dir = client_session_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.client_session_dir.mkdir(parents=True, exist_ok=True)
         self.trader_jsonl = output_dir / "trader_messages.jsonl"
         self.automated_jsonl = output_dir / "automated_messages.jsonl"
         self.client_jsonl = output_dir / "client_messages.jsonl"
@@ -464,6 +480,82 @@ class OutputWriter:
         }[enriched["message_classification"]]
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(enriched, ensure_ascii=False) + "\n")
+        if enriched["message_classification"] == "client":
+            self._append_client_session(enriched)
+
+    def _append_client_session(self, event: dict[str, Any]) -> None:
+        client_id = clean(event.get("actor_id") or event.get("sender_id"))
+        room = room_id(event)
+        path = self.client_session_dir / f"{safe_filename(client_id)}.json"
+        if path.exists():
+            document = json.loads(path.read_text(encoding="utf-8-sig"))
+        else:
+            document = {
+                "record_type": "client_message_sessions",
+                "client_id": client_id,
+                "client_name": clean(event.get("sender_name") or event.get("sender")),
+                "generated_at": utc_now(),
+                "session_count": 0,
+                "message_count": 0,
+                "sessions": [],
+            }
+
+        timestamp = event_timestamp(event) or utc_now()
+        session_id = "CS-" + hashlib.sha256(
+            f"{client_id}|{room}".encode("utf-8")
+        ).hexdigest()[:16]
+        session = next(
+            (
+                item
+                for item in document["sessions"]
+                if item.get("session_id") == session_id
+            ),
+            None,
+        )
+        if session is None:
+            session = {
+                "session_id": session_id,
+                "room_id": room,
+                "opened_at": timestamp,
+                "updated_at": timestamp,
+                "message_count": 0,
+                "messages": [],
+            }
+            document["sessions"].append(session)
+
+        key = event_key(event, client_id, clean(event.get("message")))
+        if any(item.get("event_id") == key for item in session["messages"]):
+            return
+        session["messages"].append(
+            {
+                "event_id": key,
+                "timestamp": timestamp,
+                "room_id": room,
+                "sender_id": client_id,
+                "sender_name": clean(event.get("sender_name") or event.get("sender")),
+                "message": clean(event.get("message")),
+                "classification_reasons": event.get("classification_reasons", []),
+                "raw": event,
+            }
+        )
+        session["updated_at"] = timestamp
+        session["message_count"] = len(session["messages"])
+        document["client_name"] = (
+            clean(event.get("sender_name") or event.get("sender"))
+            or document.get("client_name", "")
+        )
+        document["generated_at"] = utc_now()
+        document["session_count"] = len(document["sessions"])
+        document["message_count"] = sum(
+            item["message_count"] for item in document["sessions"]
+        )
+
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
 
     @staticmethod
     def message_classification(
@@ -544,7 +636,11 @@ def parse_ids(value: str) -> set[str]:
     return ids
 
 
-def rebuild_outputs(output_dir: Path, registry_db: Path) -> None:
+def rebuild_outputs(
+    output_dir: Path,
+    client_session_dir: Path,
+    registry_db: Path,
+) -> None:
     for name in (
         "client_messages.jsonl",
         "trader_messages.jsonl",
@@ -559,6 +655,9 @@ def rebuild_outputs(output_dir: Path, registry_db: Path) -> None:
     ):
         path = output_dir / name
         if path.exists():
+            path.unlink()
+    if client_session_dir.exists():
+        for path in client_session_dir.glob("*.json"):
             path.unlink()
     if registry_db.exists():
         registry_db.unlink()
@@ -587,20 +686,36 @@ def main() -> int:
         default=str(Path(__file__).resolve().parent),
     )
     parser.add_argument(
+        "--client-session-dir",
+        default="",
+        help=(
+            "Directory for one JSON file per client. "
+            "Defaults to <output-dir>/client_sessions_by_client."
+        ),
+    )
+    parser.add_argument(
         "--registry-db",
         default=str(Path(__file__).resolve().parent / "trader_registry.sqlite3"),
     )
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Clear this pipeline's four JSONL outputs and registry DB before reprocessing",
+        help=(
+            "Clear JSONL outputs, per-client JSON files, and registry DB "
+            "before reprocessing"
+        ),
     )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
+    client_session_dir = (
+        Path(args.client_session_dir)
+        if args.client_session_dir
+        else output_dir / "client_sessions_by_client"
+    )
     registry_db = Path(args.registry_db)
     if args.rebuild:
-        rebuild_outputs(output_dir, registry_db)
+        rebuild_outputs(output_dir, client_session_dir, registry_db)
 
     store = RegistryStore(
         registry_db,
@@ -609,7 +724,8 @@ def main() -> int:
         args.min_trade_messages,
         parse_ids(args.additional_client_ids),
     )
-    writer = OutputWriter(output_dir)
+    writer = OutputWriter(output_dir, client_session_dir)
+    print(f"Per-client session output: {client_session_dir}")
     try:
         if args.follow:
             run_follow(args, store, writer)
